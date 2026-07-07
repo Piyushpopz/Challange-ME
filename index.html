@@ -430,7 +430,13 @@
   // to Anthropic's artifact storage, scoped privately to this user, so it
   // survives closing the tab and coming back later.
   var STORAGE_KEY = "mission-calendar:challenges";
-  var storageReady = (typeof window !== "undefined" && window.storage);
+
+  // IMPORTANT SAFETY GATE: we only allow saveState() to actually write once
+  // a load attempt has genuinely finished (success OR confirmed-empty).
+  // This is what prevents the bug where an early, not-yet-ready storage
+  // connection gets mistaken for "no data" and then a save overwrites real
+  // saved data with an empty/partial state.
+  var loadFinished = false;
 
   function toSerializable(){
     return challenges.map(function(c){
@@ -441,8 +447,31 @@
     });
   }
 
+  // Poll for window.storage to actually exist before trusting it — on first
+  // paint the host page may not have finished wiring it up yet.
+  function waitForStorage(maxAttempts, delayMs){
+    return new Promise(function(resolve){
+      var attempts = 0;
+      (function check(){
+        if (typeof window !== "undefined" && window.storage){ resolve(true); return; }
+        attempts++;
+        if (attempts >= maxAttempts){ resolve(false); return; }
+        setTimeout(check, delayMs);
+      })();
+    });
+  }
+
   function saveState(){
-    if (!storageReady) return;
+    if (!loadFinished){
+      // Refuse to save until we know what was actually there before —
+      // saving now could clobber real data with an incomplete picture.
+      console.warn("Save skipped: initial load hasn't completed yet.");
+      return;
+    }
+    if (!window.storage){
+      showToast("Couldn't reach saved storage — changes may not persist.");
+      return;
+    }
     try {
       window.storage.set(STORAGE_KEY, JSON.stringify(toSerializable()), false)
         .then(function(res){ if (!res) console.warn("Save returned no result."); })
@@ -453,25 +482,48 @@
   }
 
   function loadState(){
-    if (!storageReady) return Promise.resolve();
-    return window.storage.get(STORAGE_KEY, false)
-      .then(function(res){
-        if (!res || !res.value) return;
-        var parsed = JSON.parse(res.value);
-        challenges = parsed.map(function(c){
-          return {
-            id: c.id, title: c.title, days: c.days,
-            startKey: c.startKey, rangeKeys: c.rangeKeys,
-            rangeSet: new Set(c.rangeKeys),
-            statusMap: c.statusMap || {}
-          };
-        });
-      })
-      .catch(function(){
-        // No saved data yet for this user — that's a normal first run, not an error.
-        challenges = [];
-      });
+    return waitForStorage(20, 150).then(function(available){
+      if (!available){
+        loadFinished = true; // allow saving going forward, but warn the user
+        showToast("Couldn't connect to saved data this session.");
+        return;
+      }
+      // Try the fetch itself up to 3 times — a single transient failure
+      // should never be read as "this user has no data."
+      var attempt = 0;
+      function tryGet(){
+        attempt++;
+        return window.storage.get(STORAGE_KEY, false)
+          .then(function(res){
+            if (res && res.value){
+              var parsed = JSON.parse(res.value);
+              challenges = parsed.map(function(c){
+                return {
+                  id: c.id, title: c.title, days: c.days,
+                  startKey: c.startKey, rangeKeys: c.rangeKeys,
+                  rangeSet: new Set(c.rangeKeys),
+                  statusMap: c.statusMap || {}
+                };
+              });
+            }
+            loadFinished = true;
+          })
+          .catch(function(err){
+            // window.storage throws on a missing key too — that's the
+            // normal "nothing saved yet" case for a first-time user.
+            var msg = (err && err.message) ? err.message.toLowerCase() : "";
+            var looksLikeMissingKey = msg.indexOf("not found") !== -1 || msg.indexOf("404") !== -1 || msg === "";
+            if (looksLikeMissingKey || attempt >= 3){
+              loadFinished = true;
+              return;
+            }
+            return new Promise(function(res){ setTimeout(res, 250); }).then(tryGet);
+          });
+      }
+      return tryGet();
+    });
   }
+
 
   function clearAllData(){
     challenges = [];
@@ -701,6 +753,10 @@
   });
 
   document.getElementById("goChallengeBtn").addEventListener("click", function(){
+    if (!loadFinished){
+      showToast("Still loading your saved data — one second, then try again.");
+      return;
+    }
     var titleInput = document.getElementById("challengeTitle");
     var daysInput = document.getElementById("challengeDays");
     var titleErr = document.getElementById("titleErr");
@@ -777,6 +833,10 @@
   document.getElementById("dayModalList").addEventListener("click", function(e){
     var btn = e.target.closest(".mini-btn");
     if (!btn) return;
+    if (!loadFinished){
+      showToast("Still loading your saved data — one second, then try again.");
+      return;
+    }
     var chId = btn.dataset.id;
     var action = btn.dataset.action;
     var ch = challenges.find(function(c){ return c.id === chId; });
